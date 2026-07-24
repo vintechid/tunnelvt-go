@@ -89,7 +89,7 @@ func (c *Client) tryConnect() error {
 	}
 
 	log.Printf("[tunnelvt] connected — %s/%s -> localhost:%d", c.username, c.App, c.Port)
-	fmt.Printf("https://gotunnel.vinstechid.com/%s/%s/\n", c.username, c.App)
+fmt.Printf("https://gotunnel.vinstechid.com/a/%s/%s/\n", c.username, c.App)
 	return c.forwardLoop()
 }
 
