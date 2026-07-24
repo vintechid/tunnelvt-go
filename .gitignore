@@ -3,5 +3,5 @@ bin/
 *.exe
 *.test
 *.out
-tunnelvt
-tunnelvtd
+/tunnelvt
+/tunnelvtd
