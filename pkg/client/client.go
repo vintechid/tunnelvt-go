@@ -18,7 +18,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/vintechids/tunnelvt-go/pkg/protocol"
+	"github.com/vintechid/tunnelvt-go/pkg/protocol"
 )
 
 // Client holds the tunnel client configuration.

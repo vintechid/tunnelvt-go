@@ -1,4 +1,4 @@
-module github.com/vintechids/tunnelvt-go
+module github.com/vintechid/tunnelvt-go
 
 go 1.22
 
