@@ -1,0 +1,43 @@
+name: release
+
+# Push a tag: git tag v0.1.0 && git push origin v0.1.0
+# Go proxy auto-indexes the tag — no "publish" step needed.
+# This workflow builds binaries and attaches them to a GitHub Release.
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: build
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          HASH=$(git rev-parse --short HEAD)
+          LDFLAGS="-s -w -X github.com/vintechid/tunnelvt-go/pkg/client.BuildHash=${TAG}-${HASH}"
+          mkdir -p dist
+          for pair in \
+            "linux/amd64" "linux/arm64" \
+            "darwin/amd64" "darwin/arm64" \
+            "windows/amd64"
+          do
+            GOOS=${pair%/*} GOARCH=${pair#*/}
+            OUT="dist/tunnelvt-${GOOS}-${GOARCH}"
+            [ "$GOOS" = "windows" ] && OUT="${OUT}.exe"
+            go build -ldflags "$LDFLAGS" -o "$OUT" ./cmd/tunnelvt
+          done
+          ls -lh dist/
+
+      - name: release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
