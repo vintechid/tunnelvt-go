@@ -19,8 +19,8 @@ type Message struct {
 	Type    MessageType       `json:"type"`
 	ID      string            `json:"id,omitempty"`
 	JWT     string            `json:"jwt,omitempty"`
-	Version string            `json:"version,omitempty"`  // client version
-	VHash   string            `json:"vhash,omitempty"`    // build hash (ldflags)
+	Version string            `json:"version,omitempty"`
+	VHash   string            `json:"vhash,omitempty"`
 	Device  string            `json:"device,omitempty"`
 	App     string            `json:"app,omitempty"`
 	Port    int               `json:"port,omitempty"`
@@ -32,6 +32,7 @@ type Message struct {
 	Error   string            `json:"error,omitempty"`
 }
 
+// GenerateDeviceID returns a random 16-char hex device signature.
 func GenerateDeviceID() string {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
