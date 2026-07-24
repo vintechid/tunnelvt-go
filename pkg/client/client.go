@@ -1,8 +1,8 @@
-// Package client implements the tunnelvt client: connect to server via WebSocket,
-// register a device+app mapping, and forward incoming requests to a local port.
+// Package client implements the tunnelvt client: connect to the gotunnel server
+// via WebSocket, register a device+app mapping, and forward incoming requests
+// to a local port.
 //
-// Designed to work through Cloudflare — WebSocket upgrade happens over HTTP.
-// Server IP stays hidden behind the CDN.
+// The server URL is hardcoded — clients always connect to gotunnel.
 package client
 
 import (
@@ -21,33 +21,28 @@ import (
 	"github.com/vintechid/tunnelvt-go/pkg/protocol"
 )
 
+const defaultServer = "https://gotunnel.vinstechid.com"
+
 // Client holds the tunnel client configuration.
 type Client struct {
-	ServerURL string // e.g. "https://tunnel.example.com"
-	Token     string // pre-shared auth token
-	Device    string // pre-set device ID; random if empty
-	App       string // app name for this tunnel
-	Port      int    // local port to expose
+	Token string
+	App   string
+	Port  int
 
+	device string
 	conn    *websocket.Conn
 	writeMu sync.Mutex
 }
 
-// New creates a Client. Device can be empty (randomly assigned).
-func New(serverURL, token, device, app string, port int) *Client {
-	return &Client{
-		ServerURL: serverURL,
-		Token:     token,
-		Device:    device,
-		App:       app,
-		Port:      port,
-	}
+// New creates a Client with a random device ID.
+func New(token, app string, port int) *Client {
+	return &Client{Token: token, App: app, Port: port}
 }
 
 // Connect dials the server, registers the tunnel, and blocks forwarding
 // requests until the connection drops.
 func (c *Client) Connect() error {
-	wsURL, err := buildWSURL(c.ServerURL)
+	wsURL, err := buildWSURL(defaultServer)
 	if err != nil {
 		return fmt.Errorf("invalid server URL: %w", err)
 	}
@@ -59,18 +54,10 @@ func (c *Client) Connect() error {
 	c.conn = conn
 	defer conn.Close()
 
-	// Register.
-	device := c.Device
-	if device == "" {
-		device = protocol.GenerateDeviceID()
-	}
+	c.device = protocol.GenerateDeviceID()
 
 	if err := c.writeJSON(protocol.Message{
-		Type:   protocol.TypeRegister,
-		Token:  c.Token,
-		Device: device,
-		App:    c.App,
-		Port:   c.Port,
+		Type: protocol.TypeRegister, Token: c.Token, Device: c.device, App: c.App, Port: c.Port,
 	}); err != nil {
 		return fmt.Errorf("register write error: %w", err)
 	}
@@ -83,15 +70,15 @@ func (c *Client) Connect() error {
 		return fmt.Errorf("server rejected registration: %s", ack.Error)
 	}
 
-	c.Device = ack.Device
-	log.Printf("[tunnelvt] connected — %s/%s -> localhost:%d", c.Device, c.App, c.Port)
+	c.device = ack.Device
+	log.Printf("[tunnelvt] connected — %s/%s -> localhost:%d", c.device, c.App, c.Port)
+	fmt.Printf("https://gotunnel.vinstechid.com/%s/%s/\n", c.device, c.App)
 
 	return c.forwardLoop()
 }
 
 func (c *Client) forwardLoop() error {
 	httpClient := &http.Client{Timeout: 25 * time.Second}
-
 	for {
 		var msg protocol.Message
 		if err := c.conn.ReadJSON(&msg); err != nil {
@@ -100,7 +87,6 @@ func (c *Client) forwardLoop() error {
 			}
 			return nil
 		}
-
 		if msg.Type == protocol.TypeRequest {
 			go c.handleRequest(httpClient, msg)
 		}
@@ -118,18 +104,15 @@ func (c *Client) doLocalRequest(httpClient *http.Client, msg protocol.Message) p
 	errResp := func(errStr string) protocol.Message {
 		return protocol.Message{Type: protocol.TypeError, ID: msg.ID, Error: errStr}
 	}
-
 	bodyBytes, err := base64.StdEncoding.DecodeString(msg.Body)
 	if err != nil {
 		return errResp("invalid body encoding")
 	}
-
 	localURL := fmt.Sprintf("http://localhost:%d%s", c.Port, msg.Path)
 	req, err := http.NewRequest(msg.Method, localURL, strings.NewReader(string(bodyBytes)))
 	if err != nil {
 		return errResp(fmt.Sprintf("create local request: %v", err))
 	}
-
 	for k, v := range msg.Headers {
 		if !isHopByHop(k) {
 			req.Header.Set(k, v)
@@ -138,26 +121,19 @@ func (c *Client) doLocalRequest(httpClient *http.Client, msg protocol.Message) p
 	if host, ok := msg.Headers["Host"]; ok && host != "" {
 		req.Host = host
 	}
-
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return errResp(fmt.Sprintf("local request failed: %v", err))
 	}
 	defer resp.Body.Close()
-
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
-
 	respHeaders := make(map[string]string)
 	for k := range resp.Header {
 		respHeaders[k] = resp.Header.Get(k)
 	}
-
 	return protocol.Message{
-		Type:    protocol.TypeResponse,
-		ID:      msg.ID,
-		Status:  resp.StatusCode,
-		Headers: respHeaders,
-		Body:    base64.StdEncoding.EncodeToString(respBody),
+		Type: protocol.TypeResponse, ID: msg.ID, Status: resp.StatusCode,
+		Headers: respHeaders, Body: base64.StdEncoding.EncodeToString(respBody),
 	}
 }
 
