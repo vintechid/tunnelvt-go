@@ -1,5 +1,5 @@
-// Package client implements the tunnelvt client: username+password → JWT.
-// JWT auto-refreshes when expired. User types credentials once.
+// Package client implements the tunnelvt client: username+password → JWT,
+// auto-reconnect with exponential backoff + jitter.
 package client
 
 import (
@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -40,8 +42,6 @@ type Client struct {
 	username string
 	password string
 	jwt      string
-	conn     *websocket.Conn
-	writeMu  sync.Mutex
 }
 
 func New(app string, port int) *Client {
@@ -49,18 +49,32 @@ func New(app string, port int) *Client {
 }
 
 func (c *Client) Connect() error {
+	if err := c.ensureJWT(); err != nil {
+		return err
+	}
+
+	backoff := 1 * time.Second
+	const maxBackoff = 60 * time.Second
+
 	for {
-		if err := c.ensureJWT(); err != nil {
-			return err
+		err := c.tryConnect()
+		if err == nil {
+			backoff = 1 * time.Second
+			continue
 		}
-		if err := c.tryConnect(); err != nil {
-			if strings.Contains(err.Error(), "invalid or expired") {
-				c.jwt = ""
-				continue
+		if strings.Contains(err.Error(), "invalid or expired") {
+			c.jwt = ""
+			if err := c.ensureJWT(); err != nil {
+				return err
 			}
-			return err
+			backoff = 1 * time.Second
+			continue
 		}
-		return nil
+		jitter := time.Duration(float64(backoff) * 0.25 * (rand.Float64()*2 - 1))
+		wait := backoff + jitter
+		log.Printf("[tunnelvt] reconnecting in %v", wait.Round(time.Millisecond))
+		time.Sleep(wait)
+		backoff = time.Duration(math.Min(float64(backoff*2), float64(maxBackoff)))
 	}
 }
 
@@ -70,10 +84,16 @@ func (c *Client) tryConnect() error {
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
-	c.conn = conn
 	defer conn.Close()
 
-	if err := c.writeJSON(protocol.Message{
+	var writeMu sync.Mutex
+	writeJSON := func(v any) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return conn.WriteJSON(v)
+	}
+
+	if err := writeJSON(protocol.Message{
 		Type: protocol.TypeRegister, JWT: c.jwt, App: c.App, Port: c.Port,
 		Version: "1.0.0", VHash: BuildHash,
 	}); err != nil {
@@ -89,8 +109,52 @@ func (c *Client) tryConnect() error {
 	}
 
 	log.Printf("[tunnelvt] connected — %s/%s -> localhost:%d", c.username, c.App, c.Port)
-fmt.Printf("https://gotunnel.vinstechid.com/a/%s/%s/\n", c.username, c.App)
-	return c.forwardLoop()
+	fmt.Fprintf(os.Stderr, "https://gotunnel.vinstechid.com/a/%s/%s/\n", c.username, c.App)
+
+	httpClient := &http.Client{Timeout: 25 * time.Second}
+	for {
+		var msg protocol.Message
+		if err := conn.ReadJSON(&msg); err != nil {
+			return nil
+		}
+		if msg.Type == protocol.TypeRequest {
+			go func() {
+				resp := c.doLocal(httpClient, msg)
+				writeJSON(resp)
+			}()
+		}
+	}
+}
+
+func (c *Client) doLocal(httpClient *http.Client, msg protocol.Message) protocol.Message {
+	errResp := func(e string) protocol.Message {
+		return protocol.Message{Type: protocol.TypeError, ID: msg.ID, Error: e}
+	}
+	bodyBytes, _ := base64.StdEncoding.DecodeString(msg.Body)
+	localURL := fmt.Sprintf("http://localhost:%d%s", c.Port, msg.Path)
+	req, _ := http.NewRequest(msg.Method, localURL, strings.NewReader(string(bodyBytes)))
+	for k, v := range msg.Headers {
+		if !isHopByHop(k) {
+			req.Header.Set(k, v)
+		}
+	}
+	if host, ok := msg.Headers["Host"]; ok && host != "" {
+		req.Host = host
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return errResp(fmt.Sprintf("local request failed: %v", err))
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+	respHeaders := make(map[string]string)
+	for k := range resp.Header {
+		respHeaders[k] = resp.Header.Get(k)
+	}
+	return protocol.Message{
+		Type: protocol.TypeResponse, ID: msg.ID, Status: resp.StatusCode,
+		Headers: respHeaders, Body: base64.StdEncoding.EncodeToString(respBody),
+	}
 }
 
 func (c *Client) ensureJWT() error {
@@ -174,64 +238,6 @@ func fetchJWT(serverURL, username, password string) (string, error) {
 	return out.JWT, nil
 }
 
-func (c *Client) forwardLoop() error {
-	httpClient := &http.Client{Timeout: 25 * time.Second}
-	for {
-		var msg protocol.Message
-		if err := c.conn.ReadJSON(&msg); err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				return fmt.Errorf("ws: %w", err)
-			}
-			return nil
-		}
-		if msg.Type == protocol.TypeRequest {
-			go c.handleRequest(httpClient, msg)
-		}
-	}
-}
-
-func (c *Client) handleRequest(httpClient *http.Client, msg protocol.Message) {
-	respMsg := c.doLocalRequest(httpClient, msg)
-	c.writeJSON(respMsg)
-}
-
-func (c *Client) doLocalRequest(httpClient *http.Client, msg protocol.Message) protocol.Message {
-	errResp := func(e string) protocol.Message {
-		return protocol.Message{Type: protocol.TypeError, ID: msg.ID, Error: e}
-	}
-	bodyBytes, _ := base64.StdEncoding.DecodeString(msg.Body)
-	localURL := fmt.Sprintf("http://localhost:%d%s", c.Port, msg.Path)
-	req, _ := http.NewRequest(msg.Method, localURL, strings.NewReader(string(bodyBytes)))
-	for k, v := range msg.Headers {
-		if !isHopByHop(k) {
-			req.Header.Set(k, v)
-		}
-	}
-	if host, ok := msg.Headers["Host"]; ok && host != "" {
-		req.Host = host
-	}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return errResp(fmt.Sprintf("local request failed: %v", err))
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
-	respHeaders := make(map[string]string)
-	for k := range resp.Header {
-		respHeaders[k] = resp.Header.Get(k)
-	}
-	return protocol.Message{
-		Type: protocol.TypeResponse, ID: msg.ID, Status: resp.StatusCode,
-		Headers: respHeaders, Body: base64.StdEncoding.EncodeToString(respBody),
-	}
-}
-
-func (c *Client) writeJSON(v any) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	return c.conn.WriteJSON(v)
-}
-
 func buildWSURL(u string) (string, error) {
 	p, err := url.Parse(u)
 	if err != nil {
@@ -244,7 +250,6 @@ func buildWSURL(u string) (string, error) {
 	}
 	p.Path = "/_tunnel/connect"
 	p.RawQuery = ""
-	p.Fragment = ""
 	return p.String(), nil
 }
 
