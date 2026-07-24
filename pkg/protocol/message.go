@@ -1,4 +1,3 @@
-// Package protocol defines shared message types and utilities for tunnelvt.
 package protocol
 
 type MessageType string
@@ -13,6 +12,7 @@ const (
 type Message struct {
 	Type     MessageType       `json:"type"`
 	ID       string            `json:"id,omitempty"`
+	JWT      string            `json:"jwt,omitempty"`
 	Username string            `json:"username,omitempty"`
 	Password string            `json:"password,omitempty"`
 	Version  string            `json:"version,omitempty"`

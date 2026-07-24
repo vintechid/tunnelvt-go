@@ -1,9 +1,10 @@
-// Package client implements the tunnelvt client: prompt for username+password
-// on first run, save to ~/.tunnelvt.json, connect to gotunnel.
+// Package client implements the tunnelvt client: username+password → JWT.
+// JWT auto-refreshes when expired. User types credentials once.
 package client
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -25,7 +26,6 @@ import (
 
 const defaultServer = "https://gotunnel.vinstechid.com"
 
-// BuildHash is set at compile time via ldflags.
 var BuildHash = "dev"
 
 func identityFile() string {
@@ -39,6 +39,7 @@ type Client struct {
 
 	username string
 	password string
+	jwt      string
 	conn     *websocket.Conn
 	writeMu  sync.Mutex
 }
@@ -48,90 +49,129 @@ func New(app string, port int) *Client {
 }
 
 func (c *Client) Connect() error {
-	if err := c.loadOrPrompt(); err != nil {
-		return fmt.Errorf("credentials: %w", err)
+	for {
+		if err := c.ensureJWT(); err != nil {
+			return err
+		}
+		if err := c.tryConnect(); err != nil {
+			if strings.Contains(err.Error(), "invalid or expired") {
+				c.jwt = ""
+				continue
+			}
+			return err
+		}
+		return nil
 	}
+}
 
-	wsURL, err := buildWSURL(defaultServer)
-	if err != nil {
-		return fmt.Errorf("invalid server URL: %w", err)
-	}
-
+func (c *Client) tryConnect() error {
+	wsURL, _ := buildWSURL(defaultServer)
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
-		return fmt.Errorf("dial error: %w", err)
+		return fmt.Errorf("dial: %w", err)
 	}
 	c.conn = conn
 	defer conn.Close()
 
 	if err := c.writeJSON(protocol.Message{
-		Type: protocol.TypeRegister, Username: c.username, Password: c.password,
-		App: c.App, Port: c.Port, Version: "1.0.0", VHash: BuildHash,
+		Type: protocol.TypeRegister, JWT: c.jwt, App: c.App, Port: c.Port,
+		Version: "1.0.0", VHash: BuildHash,
 	}); err != nil {
-		return fmt.Errorf("register write error: %w", err)
+		return fmt.Errorf("register: %w", err)
 	}
 
 	var ack protocol.Message
 	if err := conn.ReadJSON(&ack); err != nil {
-		return fmt.Errorf("register ack error: %w", err)
+		return fmt.Errorf("ack: %w", err)
 	}
 	if ack.Type == protocol.TypeError {
-		os.Remove(identityFile())
 		return fmt.Errorf("server rejected: %s", ack.Error)
-	}
-
-	if ack.Status == 201 {
-		log.Printf("[tunnelvt] account created — welcome, %s!", c.username)
 	}
 
 	log.Printf("[tunnelvt] connected — %s/%s -> localhost:%d", c.username, c.App, c.Port)
 	fmt.Printf("https://gotunnel.vinstechid.com/%s/%s/\n", c.username, c.App)
-
 	return c.forwardLoop()
 }
 
-func (c *Client) loadOrPrompt() error {
+func (c *Client) ensureJWT() error {
 	data, err := os.ReadFile(identityFile())
 	if err == nil {
 		var creds struct {
 			Username string `json:"username"`
 			Password string `json:"password"`
+			JWT      string `json:"jwt"`
 		}
 		if json.Unmarshal(data, &creds) == nil && creds.Username != "" {
 			c.username = creds.Username
 			c.password = creds.Password
-			return nil
+			c.jwt = creds.JWT
 		}
 	}
 
-	fmt.Print("Username: ")
-	scanner := bufio.NewScanner(os.Stdin)
-	if !scanner.Scan() {
-		return fmt.Errorf("no input")
-	}
-	c.username = strings.TrimSpace(scanner.Text())
 	if c.username == "" {
-		return fmt.Errorf("username required")
+		fmt.Print("Username: ")
+		sc := bufio.NewScanner(os.Stdin)
+		if !sc.Scan() {
+			return fmt.Errorf("no input")
+		}
+		c.username = strings.TrimSpace(sc.Text())
+		if c.username == "" {
+			return fmt.Errorf("username required")
+		}
+		fmt.Print("Password: ")
+		p, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		if err != nil {
+			return err
+		}
+		c.password = strings.TrimSpace(string(p))
+		if c.password == "" {
+			return fmt.Errorf("password required")
+		}
 	}
 
-	fmt.Print("Password: ")
-	p, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Println()
-	if err != nil {
-		return fmt.Errorf("read password: %w", err)
-	}
-	c.password = strings.TrimSpace(string(p))
-	if c.password == "" {
-		return fmt.Errorf("password required")
+	if c.jwt == "" {
+		j, err := fetchJWT(defaultServer, c.username, c.password)
+		if err != nil {
+			os.Remove(identityFile())
+			c.username = ""
+			c.password = ""
+			return fmt.Errorf("auth failed: %w", err)
+		}
+		c.jwt = j
 	}
 
 	creds := struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
-	}{c.username, c.password}
+		JWT      string `json:"jwt"`
+	}{c.username, c.password, c.jwt}
 	b, _ := json.Marshal(creds)
 	os.WriteFile(identityFile(), b, 0o600)
 	return nil
+}
+
+func fetchJWT(serverURL, username, password string) (string, error) {
+	body := struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}{username, password}
+	b, _ := json.Marshal(body)
+	resp, err := http.Post(serverURL+"/_tunnel/auth", "application/json", bytes.NewReader(b))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("%s", strings.TrimSpace(string(errBody)))
+	}
+	var out struct {
+		JWT      string `json:"jwt"`
+		Username string `json:"username"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	return out.JWT, nil
 }
 
 func (c *Client) forwardLoop() error {
@@ -140,7 +180,7 @@ func (c *Client) forwardLoop() error {
 		var msg protocol.Message
 		if err := c.conn.ReadJSON(&msg); err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				return fmt.Errorf("ws read error: %w", err)
+				return fmt.Errorf("ws: %w", err)
 			}
 			return nil
 		}
@@ -152,24 +192,16 @@ func (c *Client) forwardLoop() error {
 
 func (c *Client) handleRequest(httpClient *http.Client, msg protocol.Message) {
 	respMsg := c.doLocalRequest(httpClient, msg)
-	if err := c.writeJSON(respMsg); err != nil {
-		log.Printf("[tunnelvt] write response error: %v", err)
-	}
+	c.writeJSON(respMsg)
 }
 
 func (c *Client) doLocalRequest(httpClient *http.Client, msg protocol.Message) protocol.Message {
-	errResp := func(errStr string) protocol.Message {
-		return protocol.Message{Type: protocol.TypeError, ID: msg.ID, Error: errStr}
+	errResp := func(e string) protocol.Message {
+		return protocol.Message{Type: protocol.TypeError, ID: msg.ID, Error: e}
 	}
-	bodyBytes, err := base64.StdEncoding.DecodeString(msg.Body)
-	if err != nil {
-		return errResp("invalid body encoding")
-	}
+	bodyBytes, _ := base64.StdEncoding.DecodeString(msg.Body)
 	localURL := fmt.Sprintf("http://localhost:%d%s", c.Port, msg.Path)
-	req, err := http.NewRequest(msg.Method, localURL, strings.NewReader(string(bodyBytes)))
-	if err != nil {
-		return errResp(fmt.Sprintf("create local request: %v", err))
-	}
+	req, _ := http.NewRequest(msg.Method, localURL, strings.NewReader(string(bodyBytes)))
 	for k, v := range msg.Headers {
 		if !isHopByHop(k) {
 			req.Header.Set(k, v)
@@ -200,27 +232,24 @@ func (c *Client) writeJSON(v any) error {
 	return c.conn.WriteJSON(v)
 }
 
-func buildWSURL(serverURL string) (string, error) {
-	u, err := url.Parse(serverURL)
+func buildWSURL(u string) (string, error) {
+	p, err := url.Parse(u)
 	if err != nil {
 		return "", err
 	}
-	switch u.Scheme {
-	case "https", "wss":
-		u.Scheme = "wss"
-	case "http", "ws":
-		u.Scheme = "ws"
-	default:
-		u.Scheme = "ws"
+	if p.Scheme == "https" {
+		p.Scheme = "wss"
+	} else {
+		p.Scheme = "ws"
 	}
-	u.Path = "/_tunnel/connect"
-	u.RawQuery = ""
-	u.Fragment = ""
-	return u.String(), nil
+	p.Path = "/_tunnel/connect"
+	p.RawQuery = ""
+	p.Fragment = ""
+	return p.String(), nil
 }
 
-func isHopByHop(header string) bool {
-	switch strings.ToLower(header) {
+func isHopByHop(h string) bool {
+	switch strings.ToLower(h) {
 	case "connection", "keep-alive", "proxy-authenticate",
 		"proxy-authorization", "te", "trailers",
 		"transfer-encoding", "upgrade":
