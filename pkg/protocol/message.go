@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 )
 
-// MessageType identifies the kind of tunnel message.
 type MessageType string
 
 const (
@@ -16,23 +15,23 @@ const (
 	TypeError    MessageType = "error"
 )
 
-// Message is the wire format exchanged between server and client over WebSocket.
 type Message struct {
 	Type    MessageType       `json:"type"`
 	ID      string            `json:"id,omitempty"`
-	Token   string            `json:"token,omitempty"` // pre-shared auth token (register only)
+	JWT     string            `json:"jwt,omitempty"`
+	Version string            `json:"version,omitempty"`  // client version
+	VHash   string            `json:"vhash,omitempty"`    // build hash (ldflags)
 	Device  string            `json:"device,omitempty"`
 	App     string            `json:"app,omitempty"`
 	Port    int               `json:"port,omitempty"`
 	Method  string            `json:"method,omitempty"`
 	Path    string            `json:"path,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
-	Body    string            `json:"body,omitempty"` // base64-encoded for binary safety
+	Body    string            `json:"body,omitempty"`
 	Status  int               `json:"status,omitempty"`
 	Error   string            `json:"error,omitempty"`
 }
 
-// GenerateDeviceID returns a random 16-char hex device signature.
 func GenerateDeviceID() string {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {

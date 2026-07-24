@@ -1,17 +1,20 @@
-// Package client implements the tunnelvt client: connect to the gotunnel server
-// via WebSocket, register a device+app mapping, and forward incoming requests
-// to a local port.
+// Package client implements the tunnelvt client: auto-fetch JWT from server
+// on first run, persist to ~/.tunnelvt.json, use on subsequent connects.
 //
-// The server URL is hardcoded — clients always connect to gotunnel.
+// Trust-on-first-use identity — no login, no shared token needed.
 package client
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -23,25 +26,35 @@ import (
 
 const defaultServer = "https://gotunnel.vinstechid.com"
 
-// Client holds the tunnel client configuration.
-type Client struct {
-	Token string
-	App   string
-	Port  int
+func identityFile() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".tunnelvt.json")
+}
 
-	device string
+// BuildHash is set at compile time via ldflags:
+//
+//	go build -ldflags "-X github.com/vintechid/tunnelvt-go/pkg/client.BuildHash=abc123" ./cmd/tunnelvt
+var BuildHash = "dev"
+
+type Client struct {
+	App  string
+	Port int
+
+	device  string
+	jwt     string
 	conn    *websocket.Conn
 	writeMu sync.Mutex
 }
 
-// New creates a Client with a random device ID.
-func New(token, app string, port int) *Client {
-	return &Client{Token: token, App: app, Port: port}
+func New(app string, port int) *Client {
+	return &Client{App: app, Port: port}
 }
 
-// Connect dials the server, registers the tunnel, and blocks forwarding
-// requests until the connection drops.
 func (c *Client) Connect() error {
+	if err := c.loadOrFetchIdentity(); err != nil {
+		return fmt.Errorf("identity: %w", err)
+	}
+
 	wsURL, err := buildWSURL(defaultServer)
 	if err != nil {
 		return fmt.Errorf("invalid server URL: %w", err)
@@ -54,10 +67,9 @@ func (c *Client) Connect() error {
 	c.conn = conn
 	defer conn.Close()
 
-	c.device = protocol.GenerateDeviceID()
-
 	if err := c.writeJSON(protocol.Message{
-		Type: protocol.TypeRegister, Token: c.Token, Device: c.device, App: c.App, Port: c.Port,
+		Type: protocol.TypeRegister, JWT: c.jwt, Device: c.device, App: c.App, Port: c.Port,
+		Version: "1.0.0", VHash: BuildHash,
 	}); err != nil {
 		return fmt.Errorf("register write error: %w", err)
 	}
@@ -75,6 +87,59 @@ func (c *Client) Connect() error {
 	fmt.Printf("https://gotunnel.vinstechid.com/%s/%s/\n", c.device, c.App)
 
 	return c.forwardLoop()
+}
+
+func (c *Client) loadOrFetchIdentity() error {
+	data, err := os.ReadFile(identityFile())
+	if err == nil {
+		var id struct {
+			Device string `json:"device"`
+			JWT    string `json:"jwt"`
+		}
+		if json.Unmarshal(data, &id) == nil && id.JWT != "" {
+			c.device = id.Device
+			c.jwt = id.JWT
+			return nil
+		}
+	}
+
+	c.device = protocol.GenerateDeviceID()
+	jwtStr, err := fetchJWT(defaultServer, c.device)
+	if err != nil {
+		return fmt.Errorf("fetch JWT: %w", err)
+	}
+	c.jwt = jwtStr
+
+	id := struct {
+		Device string `json:"device"`
+		JWT    string `json:"jwt"`
+	}{c.device, c.jwt}
+	b, _ := json.Marshal(id)
+	os.WriteFile(identityFile(), b, 0o600)
+
+	return nil
+}
+
+func fetchJWT(serverURL, device string) (string, error) {
+	body := struct{ Device string }{Device: device}
+	b, _ := json.Marshal(body)
+	resp, err := http.Post(serverURL+"/_tunnel/hello", "application/json", bytes.NewReader(b))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
+	}
+	var out struct {
+		JWT    string `json:"jwt"`
+		Device string `json:"device"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	return out.JWT, nil
 }
 
 func (c *Client) forwardLoop() error {
