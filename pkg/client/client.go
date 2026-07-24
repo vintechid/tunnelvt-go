@@ -1,11 +1,9 @@
-// Package client implements the tunnelvt client: auto-fetch JWT from server
-// on first run, persist to ~/.tunnelvt.json, use on subsequent connects.
-//
-// Trust-on-first-use identity — no login, no shared token needed.
+// Package client implements the tunnelvt client: prompt for username+password
+// on first run, save to ~/.tunnelvt.json, connect to gotunnel.
 package client
 
 import (
-	"bytes"
+	"bufio"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -20,30 +18,29 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/term"
 
 	"github.com/vintechid/tunnelvt-go/pkg/protocol"
 )
 
 const defaultServer = "https://gotunnel.vinstechid.com"
 
+// BuildHash is set at compile time via ldflags.
+var BuildHash = "dev"
+
 func identityFile() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".tunnelvt.json")
 }
 
-// BuildHash is set at compile time via ldflags:
-//
-//	go build -ldflags "-X github.com/vintechid/tunnelvt-go/pkg/client.BuildHash=abc123" ./cmd/tunnelvt
-var BuildHash = "dev"
-
 type Client struct {
 	App  string
 	Port int
 
-	device  string
-	jwt     string
-	conn    *websocket.Conn
-	writeMu sync.Mutex
+	username string
+	password string
+	conn     *websocket.Conn
+	writeMu  sync.Mutex
 }
 
 func New(app string, port int) *Client {
@@ -51,8 +48,8 @@ func New(app string, port int) *Client {
 }
 
 func (c *Client) Connect() error {
-	if err := c.loadOrFetchIdentity(); err != nil {
-		return fmt.Errorf("identity: %w", err)
+	if err := c.loadOrPrompt(); err != nil {
+		return fmt.Errorf("credentials: %w", err)
 	}
 
 	wsURL, err := buildWSURL(defaultServer)
@@ -68,8 +65,8 @@ func (c *Client) Connect() error {
 	defer conn.Close()
 
 	if err := c.writeJSON(protocol.Message{
-		Type: protocol.TypeRegister, JWT: c.jwt, Device: c.device, App: c.App, Port: c.Port,
-		Version: "1.0.0", VHash: BuildHash,
+		Type: protocol.TypeRegister, Username: c.username, Password: c.password,
+		App: c.App, Port: c.Port, Version: "1.0.0", VHash: BuildHash,
 	}); err != nil {
 		return fmt.Errorf("register write error: %w", err)
 	}
@@ -79,67 +76,62 @@ func (c *Client) Connect() error {
 		return fmt.Errorf("register ack error: %w", err)
 	}
 	if ack.Type == protocol.TypeError {
-		return fmt.Errorf("server rejected registration: %s", ack.Error)
+		os.Remove(identityFile())
+		return fmt.Errorf("server rejected: %s", ack.Error)
 	}
 
-	c.device = ack.Device
-	log.Printf("[tunnelvt] connected — %s/%s -> localhost:%d", c.device, c.App, c.Port)
-	fmt.Printf("https://gotunnel.vinstechid.com/%s/%s/\n", c.device, c.App)
+	if ack.Status == 201 {
+		log.Printf("[tunnelvt] account created — welcome, %s!", c.username)
+	}
+
+	log.Printf("[tunnelvt] connected — %s/%s -> localhost:%d", c.username, c.App, c.Port)
+	fmt.Printf("https://gotunnel.vinstechid.com/%s/%s/\n", c.username, c.App)
 
 	return c.forwardLoop()
 }
 
-func (c *Client) loadOrFetchIdentity() error {
+func (c *Client) loadOrPrompt() error {
 	data, err := os.ReadFile(identityFile())
 	if err == nil {
-		var id struct {
-			Device string `json:"device"`
-			JWT    string `json:"jwt"`
+		var creds struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
 		}
-		if json.Unmarshal(data, &id) == nil && id.JWT != "" {
-			c.device = id.Device
-			c.jwt = id.JWT
+		if json.Unmarshal(data, &creds) == nil && creds.Username != "" {
+			c.username = creds.Username
+			c.password = creds.Password
 			return nil
 		}
 	}
 
-	c.device = protocol.GenerateDeviceID()
-	jwtStr, err := fetchJWT(defaultServer, c.device)
-	if err != nil {
-		return fmt.Errorf("fetch JWT: %w", err)
+	fmt.Print("Username: ")
+	scanner := bufio.NewScanner(os.Stdin)
+	if !scanner.Scan() {
+		return fmt.Errorf("no input")
 	}
-	c.jwt = jwtStr
+	c.username = strings.TrimSpace(scanner.Text())
+	if c.username == "" {
+		return fmt.Errorf("username required")
+	}
 
-	id := struct {
-		Device string `json:"device"`
-		JWT    string `json:"jwt"`
-	}{c.device, c.jwt}
-	b, _ := json.Marshal(id)
+	fmt.Print("Password: ")
+	p, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Println()
+	if err != nil {
+		return fmt.Errorf("read password: %w", err)
+	}
+	c.password = strings.TrimSpace(string(p))
+	if c.password == "" {
+		return fmt.Errorf("password required")
+	}
+
+	creds := struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}{c.username, c.password}
+	b, _ := json.Marshal(creds)
 	os.WriteFile(identityFile(), b, 0o600)
-
 	return nil
-}
-
-func fetchJWT(serverURL, device string) (string, error) {
-	body := struct{ Device string }{Device: device}
-	b, _ := json.Marshal(body)
-	resp, err := http.Post(serverURL+"/_tunnel/hello", "application/json", bytes.NewReader(b))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		errBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
-	}
-	var out struct {
-		JWT    string `json:"jwt"`
-		Device string `json:"device"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
-	}
-	return out.JWT, nil
 }
 
 func (c *Client) forwardLoop() error {
