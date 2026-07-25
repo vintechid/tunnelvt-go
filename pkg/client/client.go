@@ -202,10 +202,23 @@ func (c *Client) ensureJWT() error {
 	if c.jwt == "" {
 		j, err := fetchJWT(defaultServer, c.username, c.password)
 		if err != nil {
-			os.Remove(identityFile())
-			c.username = ""
-			c.password = ""
-			return fmt.Errorf("auth failed: %w", err)
+			if strings.Contains(err.Error(), "wrong password") {
+				fmt.Fprintf(os.Stderr, "Invalid password for %s.\n", c.username)
+				c.password = ""
+				fmt.Print("Password: ")
+				p, _ := term.ReadPassword(int(os.Stdin.Fd()))
+				fmt.Println()
+				c.password = strings.TrimSpace(string(p))
+				if c.password != "" {
+					j, err = fetchJWT(defaultServer, c.username, c.password)
+				}
+			}
+			if err != nil {
+				os.Remove(identityFile())
+				c.username = ""
+				c.password = ""
+				return fmt.Errorf("auth failed: %w", err)
+			}
 		}
 		c.jwt = j
 	}
