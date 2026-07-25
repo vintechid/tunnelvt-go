@@ -62,6 +62,11 @@ func (c *Client) Connect() error {
 			backoff = 1 * time.Second
 			continue
 		}
+		if strings.Contains(err.Error(), "already registered") {
+			// Previous connection hasn't closed yet — wait and retry.
+			time.Sleep(1 * time.Second)
+			continue
+		}
 		if strings.Contains(err.Error(), "invalid or expired") {
 			c.jwt = ""
 			if err := c.ensureJWT(); err != nil {
